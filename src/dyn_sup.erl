@@ -9,11 +9,23 @@
 
 -callback init(Args :: term()) -> term().
 
--record(sup_flags, {intensity, period}).
--record(child_spec, {id, module, function, args, restart, shutdown, type, modules}).
--record(state, {module, args, flags, spec, children, restarting, terminating}).
+-record(sup_flags, {intensity :: non_neg_integer(),
+                    period :: pos_integer()}).
+-record(child_spec, {start :: {module(), atom(), [term()]},
+                     restart :: 'temporary' | 'transient',
+                     shutdown :: 'brutal_kill' | 'infinity' | non_neg_integer(),
+                     type :: 'worker' | 'supervisor',
+                     modules :: [module()] | 'dynamic'}).
+-record(state, {module :: module(),
+                args :: [term()],
+                restarts=[] :: [integer()],
+                sup_flags :: #sup_flags{},
+                child_spec :: #child_spec{},
+                children=#{} :: #{pid() => {reference(), [term()]}},
+                restarting=#{} :: #{reference() => [term()]},
+                terminating=#{} :: #{pid() => {reference(), 'undefined' | reference(), [gen_server:from()]}}}).
 
--spec start_link(_, _) -> _.
+-spec start_link(module(), term()) -> supervisor:startlink_ret().
 start_link(Mod, Args) ->
         gen_server:start_link(?MODULE, {undefined, Mod, Args}, []).
 
@@ -41,10 +53,10 @@ count_children(SupRef) ->
 init({_SupName, Mod, Args}) ->
         process_flag(trap_exit, true),
         case Mod:init(Args) of
-                {ok, {Flags, Spec}} ->
-                        case check_init(Flags, Spec) of
-                                {ok, F, S} ->
-                                        {ok, #state{module=Mod, args=Args, flags=F, spec=S, children=#{}, restarting=#{}, terminating=#{}}};
+                {ok, {SupFlags, ChildSpec}} ->
+                        case check_init(SupFlags, ChildSpec) of
+                                {ok, SupFlags1, ChildSpec1} ->
+                                        {ok, #state{module=Mod, args=Args, sup_flags=SupFlags1, child_spec=ChildSpec1}};
                                 {error, Error} ->
                                         {stop, {supervisor_data, Error}}
                         end;
@@ -55,7 +67,7 @@ init({_SupName, Mod, Args}) ->
         end.
 
 -spec handle_call(_, _, _) -> _.
-handle_call(which_children, From, State=#state{spec=#child_spec{type=Type, modules=Modules}, children=Children, terminating=Terminating, restarting=Restarting}) ->
+handle_call(which_children, From, State=#state{child_spec=#child_spec{type=Type, modules=Modules}, children=Children, terminating=Terminating, restarting=Restarting}) ->
         spawn(fun() ->
                   ChildList=[{undefined, Pid, Type, Modules} || Pid <- maps:keys(Children)],
                   TerminatingList=[{undefined, Pid, Type, Modules} || Pid <- maps:keys(Terminating)],
@@ -63,7 +75,7 @@ handle_call(which_children, From, State=#state{spec=#child_spec{type=Type, modul
                   gen_server:reply(From, ChildList++TerminatingList++RestartingList, State)
               end),
         {noreply, State};
-handle_call(count_children, From, State=#state{spec=#child_spec{type=Type}, children=Children, terminating=Terminating, restarting=Restarting}) ->
+handle_call(count_children, From, State=#state{child_spec=#child_spec{type=Type}, children=Children, terminating=Terminating, restarting=Restarting}) ->
         spawn(fun() ->
                   Active = maps:size(Children) + maps:size(Terminating),
                   All = Active + maps:size(Restarting),
@@ -74,8 +86,8 @@ handle_call(count_children, From, State=#state{spec=#child_spec{type=Type}, chil
                   gen_server:reply(From, Reply)
               end),
         {noreply, State};
-handle_call({start_child, Args}, _From, State=#state{children=Children, spec=#child_spec{module=M, function=F, args=A}}) ->
-        case start_child(M, F, A, Args) of
+handle_call({start_child, Args}, _From, State=#state{children=Children, child_spec=#child_spec{start=MFA}}) ->
+        case do_start_child(MFA, Args) of
                 {ok, Pid} ->
                         Ref = monitor(process, Pid, [{tag, 'CHILD-DOWN'}]),
                         {reply, {ok, Pid}, State#state{children=Children#{Pid => {Ref, Args}}}};
@@ -87,7 +99,7 @@ handle_call({start_child, Args}, _From, State=#state{children=Children, spec=#ch
                 Other ->
                         {reply, Other, State}
         end;
-handle_call({terminate_child, Pid}, From, State=#state{children=Children, terminating=Terminating, spec=#child_spec{shutdown=Shutdown}}) when is_map_key(Pid, Children) ->
+handle_call({terminate_child, Pid}, From, State=#state{children=Children, terminating=Terminating, child_spec=#child_spec{shutdown=Shutdown}}) when is_map_key(Pid, Children) ->
         {{Ref, _}, Children1} = maps:take(Pid, Children),
         Timer = if
                     Shutdown=:=brutal_kill ->
@@ -104,24 +116,31 @@ handle_call({terminate_child, Pid}, From, State=#state{children=Children, termin
 handle_call({terminate_child, Pid}, From, State=#state{terminating=Terminating}) when is_map_key(Pid, Terminating) ->
         #{Pid := {Ref, Timer, ReplyTo}} = Terminating,
         {noreply, State#state{terminating=Terminating#{Pid => {Ref, Timer, [From|ReplyTo]}}}};
+handle_call({terminate_child, _}, _From, State) ->
+        {reply, {error, not_found}, State};
 handle_call(_Msg, _From, State) ->
         {noreply, State}.
 
 -spec handle_cast(_, _) -> _.
-handle_cast({try_restart, Ref}, State=#state{children=Children, spec=#child_spec{module=M, function=F, args=A}, restarting=Restarting}) when is_map_key(Ref, Restarting) ->
-        {Args, Restarting1}=maps:take(Ref, Restarting),
-        case start_child(M, F, A, Args) of
-                {ok, Pid} ->
-                        Mon = monitor(process, Pid, [{tag, 'CHILD-DOWN'}]),
-                        {noreply, State#state{children=Children#{Pid => {Mon, Args}}, restarting=Restarting1}};
-                {ok, Pid, _Extra} ->
-                        Mon = monitor(process, Pid, [{tag, 'CHILD-DOWN'}]),
-                        {noreply, State#state{children=Children#{Pid => {Mon, Args}}, restarting=Restarting1}};
-                ignore ->
-                        {noreply, State#state{restarting=Restarting1}};
-                {error, _} ->
-                        gen_server:cast(self(), {try_restart, Ref}),
-                        {noreply, State}
+handle_cast({try_restart, Ref}, State=#state{sup_flags=#sup_flags{intensity=Intensity, period=Period}, restarts=Restarts, children=Children, child_spec=#child_spec{start=MFA}, restarting=Restarting}) when is_map_key(Ref, Restarting) ->
+        case can_restart(Intensity, Period, Restarts) of
+                false ->
+                        {stop, shutdown, State};
+                {true, Restarts1} ->
+                        {Args, Restarting1}=maps:take(Ref, Restarting),
+                        case do_start_child(MFA, Args) of
+                                {ok, Pid} ->
+                                        Mon = monitor(process, Pid, [{tag, 'CHILD-DOWN'}]),
+                                        {noreply, State#state{children=Children#{Pid => {Mon, Args}}, restarting=Restarting1, restarts=Restarts1}};
+                                {ok, Pid, _Extra} ->
+                                        Mon = monitor(process, Pid, [{tag, 'CHILD-DOWN'}]),
+                                        {noreply, State#state{children=Children#{Pid => {Mon, Args}}, restarting=Restarting1, restarts=Restarts1}};
+                                ignore ->
+                                        {noreply, State#state{restarting=Restarting1, restarts=Restarts1}};
+                                {error, _} ->
+                                        gen_server:cast(self(), {try_restart, Ref}),
+                                        {noreply, State#state{restarts=Restarts1}}
+                        end
         end;
 handle_cast(_Msg, State) ->
         {noreply, State}.
@@ -151,7 +170,7 @@ handle_info({timeout, Timer, {terminate_timeout, Pid}}, State=#state{terminating
                 _ ->
                         {noreply, State}
         end;
-handle_info({'CHILD-DOWN', Mon, process, Pid, Reason}, State=#state{children=Children, spec=#child_spec{restart=temporary}}) when is_map_key(Pid, Children) ->
+handle_info({'CHILD-DOWN', Mon, process, Pid, Reason}, State=#state{children=Children, child_spec=#child_spec{restart=temporary}}) when is_map_key(Pid, Children) ->
         case maps:take(Pid, Children) of
                 {{Mon, _}, Children1} ->
                         unlink_flush(Pid, Reason),
@@ -159,30 +178,38 @@ handle_info({'CHILD-DOWN', Mon, process, Pid, Reason}, State=#state{children=Chi
                 _ ->
                         {noreply, State}
         end;
-handle_info({'CHILD-DOWN', Mon, process, Pid, Reason}, State=#state{children=Children, spec=#child_spec{restart=transient, module=M, function=F, args=A}, restarting=Restarting}) when is_map_key(Pid, Children) ->
+handle_info({'CHILD-DOWN', Mon, process, Pid, Reason}, State=#state{sup_flags=#sup_flags{intensity=Intensity, period=Period}, restarts=Restarts, children=Children, child_spec=#child_spec{restart=transient, start=MFA}, restarting=Restarting}) when is_map_key(Pid, Children) ->
         case maps:take(Pid, Children) of
-                {{Mon, Args}, Children1} ->
-                        DoRestart = case unlink_flush(Pid, Reason) of
-                                        normal -> false;
-                                        shutdown -> false;
-                                        {shutdown, _} -> false;
-                                        _ -> true
-                                    end,
-                        case DoRestart andalso start_child(M, F, A, Args) of
-                                false ->
-                                        {noreply, State#state{children=Children1}};
-                                ignore ->
-                                        {noreply, State#state{children=Children1}};
-                                {ok, NewPid} ->
+            {{Mon, Args}, Children1} ->
+                DoRestart = case unlink_flush(Pid, Reason) of
+                                normal -> false;
+                                shutdown -> false;
+                                {shutdown, _} -> false;
+                                _ -> true
+                            end,
+                case DoRestart of
+                    true ->
+                        case can_restart(Intensity, Period, Restarts) of
+                            false ->
+                                {stop, shutdown, State};
+                            {true, Restarts1} ->
+                                case do_start_child(MFA, Args) of
+                                    ignore ->
+                                        {noreply, State#state{children=Children1, restarts=Restarts1}};
+                                    {ok, NewPid} ->
                                         NewMon = monitor(process, NewPid, [{tag, 'CHILD-DOWN'}]),
-                                        {noreply, State#state{children=Children1#{NewPid => {NewMon, Args}}}};
-                                {ok, NewPid, _Extra} ->
+                                        {noreply, State#state{children=Children1#{NewPid => {NewMon, Args}}, restarts=Restarts1}};
+                                    {ok, NewPid, _Extra} ->
                                         NewMon = monitor(process, NewPid, [{tag, 'CHILD-DOWN'}]),
-                                        {noreply, State#state{children=Children1#{NewPid => {NewMon, Args}}}};
-                                {error, _} ->
+                                        {noreply, State#state{children=Children1#{NewPid => {NewMon, Args}}, restarts=Restarts1}};
+                                    {error, _} ->
                                         Ref = make_ref(),
                                         gen_server:cast(self(), {try_restart, Ref}),
-                                        {noreply, State#state{children=Children1, restarting=Restarting#{Ref => Args}}}
+                                        {noreply, State#state{children=Children1, restarting=Restarting#{Ref => Args}, restarts=Restarts1}}
+                                end
+                        end;
+                    false ->
+                        {noreply, State#state{children=Children1}}
                 end
         end;
 handle_info(_Msg, State) ->
@@ -193,16 +220,16 @@ terminate(_Reason, #state{children=Children, terminating=Terminating}) when Chil
         ok;
 terminate(_Reason, #state{children=Children, terminating=Terminating}) when Children=:=#{} ->
         wait_children(Terminating);
-terminate(_Reason, #state{spec=#child_spec{shutdown=Shutdown}, children=Children, terminating=Terminating}) ->
+terminate(_Reason, #state{child_spec=#child_spec{shutdown=Shutdown}, children=Children, terminating=Terminating}) ->
         do_terminate(Shutdown, Children, Terminating).
 
 -spec code_change(_, _, _) -> _.
 code_change(_OldVsn, State=#state{module=Mod, args=Args}, _Extra) ->
         case Mod:init(Args) of
-                {ok, {Flags, Spec}} ->
-                        case check_init(Flags, Spec) of
-                                {ok, F, S} ->
-                                        {ok, State#state{flags=F, spec=S}};
+                {ok, {SupFlags, ChildSpec}} ->
+                        case check_init(SupFlags, ChildSpec) of
+                                {ok, SupFlags1, ChildSpec1} ->
+                                        {ok, State#state{sup_flags=SupFlags1, child_spec=ChildSpec1}};
                                 {error, Error} ->
                                         {error, {supervisor_data, Error}}
                         end;
@@ -283,7 +310,7 @@ reply_all([ReplyTo|ReplyTos], Msg) ->
 reply_all([], _) ->
         ok.
 
-start_child(M, F, A, Args) ->
+do_start_child({M, F, A}, Args) ->
         case catch erlang:apply(M, F, A++Args) of
                 {ok, Pid} -> {ok, Pid};
                 {ok, Pid, Extra} -> {ok, Pid, Extra};
@@ -315,7 +342,7 @@ check_sup_flags(#{} = SupFlags) ->
 check_sup_flags(SupFlags) ->
         error({invalid_sup_flags, SupFlags}).
 
-check_child_spec(#{start := {M, F, A}} = ChildSpec) when is_atom(M), is_atom(F), is_list(A) ->
+check_child_spec(#{start := {M, F, A}=MFA} = ChildSpec) when is_atom(M), is_atom(F), is_list(A) ->
         {Type, DefaultShutdown} = case maps:get(type, ChildSpec, worker) of
                                       supervisor -> {supervisor, infinity};
                                       worker -> {worker, 5000};
@@ -334,16 +361,28 @@ check_child_spec(#{start := {M, F, A}} = ChildSpec) when is_atom(M), is_atom(F),
                    end,
         Modules = case maps:get(modules, ChildSpec, [M]) of
                       dynamic -> dynamic;
-                      [_]=Mod when is_atom(Mod) -> Mod;
+                      [Mod] when is_atom(Mod) -> [Mod];
                       Mod -> error({invalid_modules, Mod})
                   end,
-        #child_spec{id=make_ref(),
-                    module=M,
-                    function=F,
-                    args=A,
+        #child_spec{start=MFA,
                     restart=Restart,
                     shutdown=Shutdown,
                     type=Type,
                     modules=Modules};
 check_child_spec(ChildSpec) ->
         error({invalid_child_spec, ChildSpec}).
+
+can_restart(0, _, _) ->
+        false;
+can_restart(Intensity, Period, Restarts) ->
+        Now = erlang:monotonic_time(second),
+        can_restart(Intensity - 1, Now - Period, Restarts, [Now]).
+
+can_restart(_, _, [], Acc) ->
+        {true, lists:reverse(Acc)};
+can_restart(_, Treshold, [Restart|_], Acc) when Restart < Treshold ->
+        {true, lists:reverse(Acc)};
+can_restart(0, _, [_|_], _) ->
+        false;
+can_restart(N, Treshold, [Restart|Restarts], Acc) ->
+        can_restart(N - 1, Treshold, Restarts, [Restart|Acc]).
