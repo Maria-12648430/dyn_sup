@@ -72,7 +72,7 @@ handle_call(which_children, From, State=#state{child_spec=#child_spec{type=Type,
                   ChildList=[{undefined, Pid, Type, Modules} || Pid <- maps:keys(Children)],
                   TerminatingList=[{undefined, Pid, Type, Modules} || Pid <- maps:keys(Terminating)],
                   RestartingList=[{undefined, restarting, Type, Modules} || _ <- maps:keys(Restarting)],
-                  gen_server:reply(From, ChildList++TerminatingList++RestartingList, State)
+                  gen_server:reply(From, ChildList++TerminatingList++RestartingList)
               end),
         {noreply, State};
 handle_call(count_children, From, State=#state{child_spec=#child_spec{type=Type}, children=Children, terminating=Terminating, restarting=Restarting}) ->
