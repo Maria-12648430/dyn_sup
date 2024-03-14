@@ -7,7 +7,7 @@
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--callback init(Args :: term()) -> term().
+-callback init(Args :: term()) -> {'ok', {SupFlags :: #{atom() => term()}, ChildSpec :: #{atom() => term()}}} | 'ignore'.
 
 -define(DIRTY_RESTART_LIMIT, 1000).
 
@@ -33,27 +33,27 @@
 start_link(Mod, Args) ->
         gen_server:start_link(?MODULE, {undefined, Mod, Args}, []).
 
--spec start_link(_, _, _) -> _.
+-spec start_link(supervisor:sup_name(), module(), term()) -> supervisor:startlink_ret().
 start_link(SupName, Mod, Args) ->
         gen_server:start_link(SupName, ?MODULE, {SupName, Mod, Args}, []).
 
--spec start_child(_, _) -> _.
+-spec start_child(supervisor:sup_ref(), [term()]) -> supervisor:startchild_ret().
 start_child(SupRef, Args) when is_list(Args) ->
         gen_server:call(SupRef, {start_child, Args}, infinity).
 
--spec terminate_child(_, _) -> _.
+-spec terminate_child(supervisor:sup_ref(), pid()) -> 'ok' | {'error', 'not_found'}.
 terminate_child(SupRef, Pid) when is_pid(Pid) ->
         gen_server:call(SupRef, {terminate_child, Pid}, infinity).
 
--spec which_children(_) -> _.
+-spec which_children(supervisor:sup_ref()) -> [{'undefined', pid() | 'restarting', 'worker' | 'supervisor', [module()]}].
 which_children(SupRef) ->
         gen_server:call(SupRef, which_children, infinity).
 
--spec count_children(_) -> _.
+-spec count_children(supervisor:sup_ref()) -> [{'specs', 1} | {'active', non_neg_integer()} | {'supervisors', non_neg_integer()} | {'workers', non_neg_integer()}].
 count_children(SupRef) ->
         gen_server:call(SupRef, count_children, infinity).
 
--spec init(_) -> _.
+-spec init({'undefined' | supervisor:sup_name(), module(), term()}) -> {'ok', #state{}} | 'ignore' | {'stop', term()}.
 init({_SupName, Mod, Args}) ->
         process_flag(trap_exit, true),
         case Mod:init(Args) of
@@ -73,7 +73,7 @@ init({_SupName, Mod, Args}) ->
                         {stop, {bad_return, {Mod, init, Error}}}
         end.
 
--spec handle_call(_, _, _) -> _.
+-spec handle_call(term(), gen_server:from(), #state{}) -> {'reply', term(), #state{}} | {'noreply', #state{}}.
 handle_call(which_children, From, State=#state{child_spec=#child_spec{type=Type, modules=Modules},
                                                children=Children,
                                                terminating=Terminating,
@@ -137,7 +137,7 @@ handle_call({terminate_child, _}, _From, State) ->
 handle_call(_Msg, _From, State) ->
         {noreply, State}.
 
--spec handle_cast(_, _) -> _.
+-spec handle_cast(term(), #state{}) -> {'noreply', #state{}} | {'stop', 'shutdown', #state{}}.
 handle_cast({try_restart, Ref, RestartAttemptsLeft}, State=#state{sup_flags=#sup_flags{intensity=Intensity, period=Period},
                                                                   child_spec=#child_spec{start=MFA},
                                                                   restarts=Restarts, nrestarts=NRestarts,
@@ -167,7 +167,7 @@ handle_cast({try_restart, Ref, RestartAttemptsLeft}, State=#state{sup_flags=#sup
 handle_cast(_Msg, State) ->
         {noreply, State}.
 
--spec handle_info(_, _) -> _.
+-spec handle_info(term(), #state{}) -> {'noreply', #state{}} | {'stop', 'shutdown', #state{}}.
 handle_info({'CHILD-DOWN', Mon, process, Pid, Reason}, State=#state{terminating=Terminating}) when is_map_key(Pid, Terminating) ->
         case maps:take(Pid, Terminating) of
                 {{Mon, Timer, ReplyTo}, Terminating1} ->
@@ -242,7 +242,7 @@ handle_info({'CHILD-DOWN', Mon, process, Pid, Reason}, State=#state{sup_flags=#s
 handle_info(_Msg, State) ->
         {noreply, State}.
 
--spec terminate(_, _) -> _.
+-spec terminate(term(), #state{}) -> _.
 terminate(_Reason, #state{children=Children,
                           terminating=Terminating}) when Children=:=#{}, Terminating=:=#{} ->
         ok;
@@ -254,7 +254,7 @@ terminate(_Reason, #state{child_spec=#child_spec{shutdown=Shutdown},
                           terminating=Terminating}) ->
         do_terminate(Shutdown, Children, Terminating).
 
--spec code_change(_, _, _) -> _.
+-spec code_change(_, #state{}, _) -> {'ok', #state{}} | {'error', term()} | term().
 code_change(_OldVsn, State=#state{module=Mod, args=Args}, _Extra) ->
         case Mod:init(Args) of
                 {ok, {SupFlags, ChildSpec}} ->
